@@ -138,9 +138,12 @@ async function flushDebounce() {
 }
 
 describe("useComposerGithubAutoAttach", () => {
-  it("does not inspect or attach refs while suspended", async () => {
+  it("pauses detection and ignores a lookup that finishes while suspended", async () => {
     vi.useFakeTimers();
-    const client = createSearchClient([pr101]);
+    const lookup = deferred<ForgeSearchPayload>();
+    const client: ForgeSearchClient = {
+      searchForge: vi.fn().mockReturnValue(lookup.promise),
+    };
     const onPullRequestDetected = vi.fn();
     const { result } = renderHook(
       () =>
@@ -155,7 +158,7 @@ describe("useComposerGithubAutoAttach", () => {
     expect(result.current.isResolving).toBe(false);
     expect(onPullRequestDetected).not.toHaveBeenCalled();
     await flushDebounce();
-    expect(client.calls).toEqual([]);
+    expect(client.searchForge).not.toHaveBeenCalled();
     expect(result.current.attachments).toEqual([]);
 
     act(() => {
@@ -164,22 +167,7 @@ describe("useComposerGithubAutoAttach", () => {
     expect(result.current.isResolving).toBe(true);
     expect(onPullRequestDetected).toHaveBeenCalledTimes(1);
     await flushDebounce();
-    expect(result.current.attachments).toEqual([{ kind: "forge_change_request", item: pr101 }]);
-    vi.useRealTimers();
-  });
-
-  it("ignores an in-flight lookup while suspended", async () => {
-    vi.useFakeTimers();
-    const lookup = deferred<ForgeSearchPayload>();
-    const client: ForgeSearchClient = {
-      searchForge: vi.fn().mockReturnValue(lookup.promise),
-    };
-    const { result } = renderHook(() => useHarness(client), { wrapper: createWrapper() });
-
-    act(() => {
-      result.current.setText("Review https://github.com/acme/paseo/pull/101");
-    });
-    await flushDebounce();
+    expect(client.searchForge).toHaveBeenCalledTimes(1);
     act(() => {
       result.current.setIsSuspended(true);
     });
