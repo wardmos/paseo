@@ -25,6 +25,8 @@ interface ComposerGithubAutoAttachInput {
   isConnected: boolean;
   serverId: string;
   cwd: string;
+  /** Pause detection without resetting refs that are still present in the committed draft. */
+  isSuspended?: boolean;
   supportsForgeSearch?: boolean;
   setAttachments: Dispatch<SetStateAction<UserComposerAttachment[]>>;
   onPullRequestDetected?: () => void;
@@ -52,6 +54,9 @@ export function useComposerGithubAutoAttach(
   latestRef.current = params;
 
   useEffect(() => {
+    if (latestRef.current.isSuspended) {
+      return;
+    }
     suppressRefsCarriedAcrossTargets({
       params: latestRef.current,
       previousTargetRef,
@@ -101,6 +106,7 @@ export function useComposerGithubAutoAttach(
     params.isConnected,
     params.serverId,
     params.cwd,
+    params.isSuspended,
     params.supportsForgeSearch,
     queryClient,
   ]);
@@ -233,7 +239,12 @@ async function attachRef({
   removedRefKeys: Set<string>;
 }): Promise<void> {
   const snapshot = latestRef.current;
-  if (!snapshot.client || !snapshot.isConnected || !isRefStillPresent(ref, snapshot)) {
+  if (
+    snapshot.isSuspended ||
+    !snapshot.client ||
+    !snapshot.isConnected ||
+    !isRefStillPresent(ref, snapshot)
+  ) {
     return;
   }
 
@@ -245,6 +256,7 @@ async function attachRef({
   const current = latestRef.current;
   if (
     !item ||
+    current.isSuspended ||
     removedRefKeys.has(key) ||
     !isSameLookupTarget(snapshot, current) ||
     !isRefStillPresent(ref, current)

@@ -45,7 +45,21 @@ import { useSessionStore } from "@/stores/session-store";
 import { useFilePicker } from "@/hooks/use-file-picker";
 import { useFileDrop } from "@/components/file-drop/use-file-drop";
 import type { DroppedItem } from "@/components/file-drop/types";
-import { MessageInput, type MessageInputRef, type AttachmentMenuItem } from "./input/input";
+import {
+  MessageInput,
+  type MessageInputRef,
+  type AttachmentMenuItem,
+  type MessageInputKeyPressEvent,
+} from "./input/input";
+import {
+  applyInputHistoryKey,
+  collectInputHistory,
+  IDLE_INPUT_HISTORY_STATE,
+  isSameInputHistoryScope,
+  type InputHistoryNavigationState,
+  type InputHistoryScope,
+  type InputHistorySelection,
+} from "./input/history";
 import type { ImageAttachment, MessagePayload } from "./types";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandConfig } from "@/hooks/use-agent-commands-query";
@@ -136,9 +150,32 @@ type AttachmentListUpdater =
   | UserComposerAttachment[]
   | ((prev: UserComposerAttachment[]) => UserComposerAttachment[]);
 
+interface ComposerInputHistoryContext extends InputHistoryScope {
+  value: string;
+  selection: InputHistorySelection;
+  isAutocompleteVisible: boolean;
+  hasAttachments: boolean;
+}
+
+interface ScopedInputHistoryNavigation extends InputHistoryScope {
+  state: InputHistoryNavigationState;
+}
+
+interface ScopedInputHistoryPreview extends InputHistoryScope {
+  text: string;
+}
+
 const EMPTY_ATTACHMENT_SCOPE_KEYS: readonly string[] = [];
 
 function noop() {}
+
+function isInputHistoryKey(key: string): boolean {
+  return key === "ArrowUp" || key === "ArrowDown";
+}
+
+function hasKeyPressModifier(event: MessageInputKeyPressEvent): boolean {
+  return [event.altKey, event.ctrlKey, event.metaKey, event.shiftKey].some(Boolean);
+}
 const noopCallback = () => {};
 
 function resolveComposerButtonIconSize(): number {
@@ -1087,8 +1124,33 @@ export function Composer({
   const isDesktopWebBreakpoint = resolveIsDesktopWebBreakpoint(isCompactFormFactor);
   const isDesktopLayout = resolveIsDesktopWebBreakpoint(isCompactLayout);
   const messagePlaceholder = resolveMessagePlaceholder(isDesktopLayout, t);
-  const userInput = value;
-  const setUserInput = onChangeText;
+  const inputHistoryNavigationRef = useRef<ScopedInputHistoryNavigation>({
+    serverId,
+    agentId,
+    draftValue: value,
+    state: IDLE_INPUT_HISTORY_STATE,
+  });
+  const [inputHistoryPreview, setInputHistoryPreview] = useState<ScopedInputHistoryPreview | null>(
+    null,
+  );
+  const currentInputHistoryScope = { serverId, agentId, draftValue: value };
+  const hasCurrentInputHistoryPreview =
+    inputHistoryPreview !== null &&
+    isSameInputHistoryScope(inputHistoryPreview, currentInputHistoryScope);
+  const userInput = hasCurrentInputHistoryPreview ? inputHistoryPreview.text : value;
+  const setUserInput = useCallback(
+    (text: string) => {
+      inputHistoryNavigationRef.current = {
+        serverId,
+        agentId,
+        draftValue: text,
+        state: IDLE_INPUT_HISTORY_STATE,
+      };
+      setInputHistoryPreview(null);
+      onChangeText(text);
+    },
+    [agentId, onChangeText, serverId],
+  );
   const workspaceAttachments = useWorkspaceAttachmentsForScopes(attachmentScopeKeys);
   const {
     selectedAttachments,
@@ -1110,19 +1172,23 @@ export function Composer({
     (state) => state.sessions[serverId]?.serverInfo?.features?.forgeSearch === true,
   );
   const githubAutoAttach = useComposerGithubAutoAttach({
-    text: userInput,
+    text: value,
     remoteUrl: resolveCheckoutRemoteUrl(checkoutStatusQuery.status),
     attachments,
     client,
     isConnected,
     serverId,
     cwd,
+    isSuspended: hasCurrentInputHistoryPreview,
     supportsForgeSearch,
     setAttachments: setSelectedAttachments,
     onPullRequestDetected: onGithubPrDetected,
     onPullRequestAdded: onGithubPrAutoAttach,
   });
-  const [cursorIndex, setCursorIndex] = useState(0);
+  const [inputSelection, setInputSelection] = useState<InputHistorySelection>({
+    start: 0,
+    end: 0,
+  });
   const [isProcessing, setIsProcessing] = useState(false);
   const [isUploadingFile, setIsUploadingFile] = useState(false);
   const [isCancellingAgent, setIsCancellingAgent] = useState(false);
@@ -1175,7 +1241,7 @@ export function Composer({
 
   const autocomplete = useAgentAutocomplete({
     userInput,
-    cursorIndex,
+    cursorIndex: inputSelection.start,
     setUserInput,
     serverId,
     agentId,
@@ -1188,6 +1254,24 @@ export function Composer({
   });
   const autocompleteOnKeyPressRef = useRef(autocomplete.onKeyPress);
   autocompleteOnKeyPressRef.current = autocomplete.onKeyPress;
+  const inputHistoryContextRef = useRef<ComposerInputHistoryContext>({
+    value: userInput,
+    draftValue: value,
+    selection: inputSelection,
+    serverId,
+    agentId,
+    isAutocompleteVisible: autocomplete.isVisible,
+    hasAttachments: selectedAttachments.length > 0 || hasExternalContent,
+  });
+  inputHistoryContextRef.current = {
+    value: userInput,
+    draftValue: value,
+    selection: inputSelection,
+    serverId,
+    agentId,
+    isAutocompleteVisible: autocomplete.isVisible,
+    hasAttachments: selectedAttachments.length > 0 || hasExternalContent,
+  };
 
   // Clear send error when user edits the input
   useEffect(() => {
@@ -1197,7 +1281,14 @@ export function Composer({
   }, [userInput, sendError]);
 
   useEffect(() => {
-    setCursorIndex((current) => Math.min(current, userInput.length));
+    setInputSelection((current) => {
+      const start = Math.min(current.start, userInput.length);
+      const end = Math.min(current.end, userInput.length);
+      if (start === current.start && end === current.end) {
+        return current;
+      }
+      return { start, end };
+    });
   }, [userInput.length]);
 
   const { pickImages } = useImageAttachmentPicker();
@@ -1688,12 +1779,86 @@ export function Composer({
 
   const hasSendableContent = userInput.trim().length > 0 || selectedAttachments.length > 0;
 
-  // Handle keyboard navigation for command autocomplete.
-  const handleCommandKeyPress = useCallback(
-    (event: { key: string; preventDefault: () => void }) =>
-      autocompleteOnKeyPressRef.current(event),
-    [],
-  );
+  const handleCommandKeyPress = useCallback((event: MessageInputKeyPressEvent) => {
+    const isHistoryKey = isInputHistoryKey(event.key);
+    const isModified = hasKeyPressModifier(event);
+    if (isHistoryKey && isModified) {
+      return false;
+    }
+
+    if (autocompleteOnKeyPressRef.current(event)) {
+      return true;
+    }
+
+    const context = inputHistoryContextRef.current;
+    if (context.isAutocompleteVisible) {
+      return false;
+    }
+
+    let scopedNavigation = inputHistoryNavigationRef.current;
+    const scopeChanged = !isSameInputHistoryScope(scopedNavigation, context);
+    if (scopeChanged) {
+      scopedNavigation = {
+        serverId: context.serverId,
+        agentId: context.agentId,
+        draftValue: context.draftValue,
+        state: IDLE_INPUT_HISTORY_STATE,
+      };
+      inputHistoryNavigationRef.current = scopedNavigation;
+      setInputHistoryPreview(null);
+    }
+
+    const navigation = scopedNavigation.state;
+    if (!isHistoryKey) {
+      return false;
+    }
+
+    let history: readonly string[] = navigation.kind === "browsing" ? navigation.history : [];
+    if (navigation.kind === "idle") {
+      const canStart =
+        event.key === "ArrowUp" && context.selection.start === 0 && context.selection.end === 0;
+      if (!canStart) {
+        return false;
+      }
+      const session = useSessionStore.getState().sessions[context.serverId];
+      history = collectInputHistory(
+        session?.agentStreamTail.get(context.agentId) ?? [],
+        session?.agentStreamHead.get(context.agentId) ?? [],
+      );
+    }
+
+    const result = applyInputHistoryKey({
+      state: navigation,
+      history,
+      key: event.key,
+      value: context.value,
+      selection: context.selection,
+      isModified,
+      hasAttachments: context.hasAttachments,
+    });
+    if (!result.handled) {
+      return false;
+    }
+
+    event.preventDefault();
+    inputHistoryNavigationRef.current = {
+      serverId: context.serverId,
+      agentId: context.agentId,
+      draftValue: context.draftValue,
+      state: result.state,
+    };
+    if (result.state.kind === "idle") {
+      setInputHistoryPreview(null);
+    } else {
+      setInputHistoryPreview({
+        serverId: context.serverId,
+        agentId: context.agentId,
+        draftValue: context.draftValue,
+        text: result.value,
+      });
+    }
+    return true;
+  }, []);
 
   const cancelButtonStyle = useMemo(
     () => buildCancelButtonStyle(isConnected, isCancellingAgent),
@@ -1929,7 +2094,7 @@ export function Composer({
   }, []);
 
   const handleSelectionChange = useCallback((selection: { start: number; end: number }) => {
-    setCursorIndex(selection.start);
+    setInputSelection(selection);
   }, []);
 
   const handleFocusChange = useCallback(

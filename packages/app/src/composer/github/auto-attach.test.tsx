@@ -49,6 +49,7 @@ interface SearchCall {
 interface HarnessInput {
   initialAttachments?: UserComposerAttachment[];
   initialCwd?: string;
+  initialSuspended?: boolean;
   initialText?: string;
   onPullRequestDetected?: () => void;
   remote?: string | null;
@@ -97,6 +98,7 @@ function createWrapper() {
 
 function useHarness(client: ForgeSearchClient, input: HarnessInput = {}) {
   const [text, setText] = useState(input.initialText ?? "");
+  const [isSuspended, setIsSuspended] = useState(input.initialSuspended ?? false);
   const [searchClient, setSearchClient] = useState(client);
   const [workingDirectory, setWorkingDirectory] = useState(input.initialCwd ?? cwd);
   const [attachments, setAttachments] = useState<UserComposerAttachment[]>(
@@ -110,6 +112,7 @@ function useHarness(client: ForgeSearchClient, input: HarnessInput = {}) {
     isConnected: true,
     serverId: "server-1",
     cwd: workingDirectory,
+    isSuspended,
     setAttachments,
     onPullRequestDetected: input.onPullRequestDetected,
   });
@@ -117,6 +120,7 @@ function useHarness(client: ForgeSearchClient, input: HarnessInput = {}) {
   return {
     text,
     setText,
+    setIsSuspended,
     setSearchClient,
     setWorkingDirectory,
     attachments,
@@ -134,6 +138,61 @@ async function flushDebounce() {
 }
 
 describe("useComposerGithubAutoAttach", () => {
+  it("does not inspect or attach refs while suspended", async () => {
+    vi.useFakeTimers();
+    const client = createSearchClient([pr101]);
+    const onPullRequestDetected = vi.fn();
+    const { result } = renderHook(
+      () =>
+        useHarness(client, {
+          initialSuspended: true,
+          initialText: "Review https://github.com/acme/paseo/pull/101",
+          onPullRequestDetected,
+        }),
+      { wrapper: createWrapper() },
+    );
+
+    expect(result.current.isResolving).toBe(false);
+    expect(onPullRequestDetected).not.toHaveBeenCalled();
+    await flushDebounce();
+    expect(client.calls).toEqual([]);
+    expect(result.current.attachments).toEqual([]);
+
+    act(() => {
+      result.current.setIsSuspended(false);
+    });
+    expect(result.current.isResolving).toBe(true);
+    expect(onPullRequestDetected).toHaveBeenCalledTimes(1);
+    await flushDebounce();
+    expect(result.current.attachments).toEqual([{ kind: "forge_change_request", item: pr101 }]);
+    vi.useRealTimers();
+  });
+
+  it("ignores an in-flight lookup while suspended", async () => {
+    vi.useFakeTimers();
+    const lookup = deferred<ForgeSearchPayload>();
+    const client: ForgeSearchClient = {
+      searchForge: vi.fn().mockReturnValue(lookup.promise),
+    };
+    const { result } = renderHook(() => useHarness(client), { wrapper: createWrapper() });
+
+    act(() => {
+      result.current.setText("Review https://github.com/acme/paseo/pull/101");
+    });
+    await flushDebounce();
+    act(() => {
+      result.current.setIsSuspended(true);
+    });
+
+    await act(async () => {
+      lookup.resolve(githubPayload([pr101], "search-101"));
+      await Promise.resolve();
+    });
+    expect(result.current.attachments).toEqual([]);
+    expect(result.current.isResolving).toBe(false);
+    vi.useRealTimers();
+  });
+
   it("adds a matching pasted GitHub PR URL as a composer attachment", async () => {
     vi.useFakeTimers();
     const client = createSearchClient([pr101]);
